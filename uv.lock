@@ -3371,7 +3371,7 @@ wheels = [
 [[package]]
 name = "rag-1"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "chromadb" },
     { name = "ipykernel" },
