@@ -56,7 +56,7 @@ uv run python <文件名>.py
 | 9 | `tool_validation.py` | Agent 健壮性 | 参数校验：缺参数、类型不对都要拦住 |
 | 10 | `tool_runtime.py` | Agent 运行时 | 超时 + 重试 + 异常处理，工具执行不再拖垮整个 Agent |
 | 11 | `rag_agent.py` | 合流 | 把 RAG 检索封装成 `search_knowledge` 工具，交给 Agent 自己决定何时查库 |
-| 12 | `agent.py` | Agent 状态机 | 引入 `AgentState` + `MAX_STEPS`，工具集扩到 4 个（当前进度） |
+| 12 | `agent.py` | 有状态的 Agent | `AgentState` 外置给 `main()` + 多轮对话 + `MAX_STEPS`，工具集 4 个（当前进度） |
 
 依赖关系大致是（RAG 提供"知识"，Tool Calling 提供"手脚"，最后的 `agent.py` 是两条线合流）：
 
@@ -359,39 +359,65 @@ System Prompt 里明确写了三条约束：需要知识库就调 `search_knowle
 
 ---
 
-### 12. `agent.py` —— Agent State 与步数上限（当前进度）
+### 12. `agent.py` —— 有状态的 Agent：多轮对话（当前进度）
 
-**学习目标**：把散在函数里的局部变量收成"状态"，并给循环装一个刹车。
+**学习目标**：让 Agent 从"一问一答就退出"变成"记住上下文、能连着聊"。
 
-**变化一：显式的 `AgentState`**
-
-```python
-@dataclass
-class AgentState:
-    messages: list = field(default_factory=list)  # 对话历史 = Agent 最核心的状态
-    step: int = 0                                 # 执行到第几步
-    finished: bool = False                        # 任务是否完成
-```
-
-之前的版本 `messages` 只是 `agent()` 里的一个局部变量，循环一结束就没了。
-抽成 `AgentState` 是为了后面能接上**持久化 / 多轮会话 / 断点续跑**——
-Agent 的本质就是"一份状态 + 一个不断推进状态的循环"。
-
-**变化二：`MAX_STEPS` 刹车**
+**变化一：`AgentState` 从 `agent()` 里搬到 `main()`**
 
 ```python
-MAX_STEPS = 10
-while state.step < MAX_STEPS:
-    state.step += 1
-    ...
-return "Agent 执行超过最大步骤限制。"
+# 之前的版本：每次调用都新建 state，函数一返回就丢
+async def agent(user_question: str):
+    state = AgentState()
+
+# 现在：由调用方创建并长期持有，agent() 只负责"推进"它
+async def agent(state: AgentState):
 ```
 
-`while True` 有个致命风险：LLM 如果陷入"调工具 → 结果不满意 → 再调同一个工具"
-的死循环，程序会一直烧 Token 且永不返回。步数上限是 Agent 的**最后一道保险**，
-超过就返回兜底文案，而不是继续烧钱。
+`agent()` 不再是 state 的拥有者，只是一个推进状态的函数。
+谁创建、谁持有、活多久——决定权交回给调用方。这是把 Agent 从
+"一次性脚本"变成"常驻服务"的关键一步，也是持久化 / 断点续跑的入口。
 
-**变化三：工具集扩到 4 个**
+**变化二：多轮对话循环**
+
+```python
+state.messages.append({"role": "system", "content": "..."})   # 只初始化一次
+
+while True:
+    question = input("\n用户：")
+    if question.lower() == "exit":
+        break
+    state.messages.append({"role": "user", "content": question})
+    answer = await agent(state)        # 传的是同一个 state
+    print(f"\nAgent：{answer}")
+```
+
+System Prompt 只在启动时塞一次；之后每轮只追加新的 user 消息，
+**历史全部留在 `state.messages` 里**——所谓"记忆"就是这么实现的，没有别的魔法。
+输入 `exit` 退出。
+
+**变化三：`MAX_STEPS` 改成 `for` 循环，step 每轮重置**
+
+```python
+for step in range(MAX_STEPS):
+    state.step = step + 1
+```
+
+这不是随手改的，而是**变化一带来的必然后果**：state 现在是跨轮长期持有的，
+如果还用 `while state.step < MAX_STEPS` + `state.step += 1`，
+`step` 会跨轮累加——第一轮用掉 3 步，第二轮就从 4 开始数，聊几句就顶到上限。
+改成 `for` 之后，`step` 的语义变成"**本次任务**执行到第几步"，每轮从 1 重新数。
+
+> 于是这里有**两层循环**，别混淆：
+> 外层 `while True` 是"多轮对话"（等用户输入，可能永远不结束），
+> 内层 `for step in range(MAX_STEPS)` 是"单轮任务内的 Agent Loop"
+> （防止一次任务里工具调疯）。
+> 上一版两层是混在一个 `while True` 里的。
+>
+> 步数上限本身的作用没变：LLM 若陷入"调工具 → 不满意 → 再调同一个工具"的
+> 死循环，达到上限就返回兜底文案，而不是继续烧 Token。
+
+**变化四：工具集扩到 4 个**
 
 - `add` / `multiply` / `subtract` —— 在 `agent.py` 里**本地重新定义**（同步函数）。
   没有复用 `tool_runtime.py` 里那套 async 版本，因为那边带超时/重试，会干扰"看清主循环"这件事。
@@ -403,9 +429,27 @@ return "Agent 执行超过最大步骤限制。"
 
 > 关键认知：**Agent Loop 必须能停下来**。退出条件不止一个：
 > ① LLM 不再要求调工具（正常完成）——`tool_calling.py` 起就有；
-> ② 达到 `MAX_STEPS`（防死循环）——这个文件才补上；
-> ③ 超时预算 / 用户中断（生产环境还要有）——尚未实现。
+> ② 达到 `MAX_STEPS`（防死循环）——从上一版起有了；
+> ③ 用户主动退出——外层 `exit` 只能结束**会话**，单轮任务跑到一半是没法中断的；
+> ④ 超时预算（生产环境还要有）——尚未实现。
 > `finished` 字段目前只是被赋值，没有真正被消费——留给下一步做可观测性 / 日志用。
+
+**⚠️ 已知遗留问题：多轮对话下 assistant 的回复没有入历史**
+
+`agent()` 在 `if not message.tool_calls:` 分支里是直接
+`return message.content` 的，**没有把这条 assistant 消息 append 进 `state.messages`**。
+上一版只有一个问题、调一次就退出，所以看不出来；现在改成多轮之后，
+第二轮请求里 LLM 能看到 system、所有 user 消息、所有 tool 调用与结果，
+唯独**看不到自己上一轮说过什么**。想让它"接着刚才的说"，就得补上这一行：
+
+```python
+if not message.tool_calls:
+    state.messages.append(message)   # ← 缺的就是这句
+    state.finished = True
+    return message.content
+```
+
+同样地，`MAX_STEPS` 用尽时返回的兜底文案也没有入历史。
 
 > 另外注意这一版**把之前学的东西回退了**：没有参数校验（`tool_validation.py`）、
 > 没有超时重试（`tool_runtime.py`）、工具也是**串行**执行（`for` 循环，不是 `gather`）。
@@ -431,6 +475,8 @@ return "Agent 执行超过最大步骤限制。"
 | RAG as a Tool | `rag_agent.py` | 检索从"写死的流程"变成"LLM 决定要不要调的工具" |
 | Tool 返回值即 Prompt | `rag_agent.py` | 工具返回的文本会直接喂给 LLM，怎么拼就是怎么写 Prompt |
 | `AgentState` | `agent.py` | Agent = 一份状态 + 一个推进状态的循环 |
+| State 外置 | `agent.py` | 谁创建、谁持有 state —— 从"一次性脚本"到"常驻服务" |
+| 多轮对话 | `agent.py` | 记忆 = 历史消息全留在 `state.messages` 里，没有别的魔法 |
 | `MAX_STEPS` | `agent.py` | 防止 LLM 陷入工具死循环烧 Token 的刹车 |
 
 ---
@@ -456,7 +502,7 @@ uv run python tool_runtime.py
 # 4. 合流：把 RAG 当成工具交给 Agent（依赖第 1 步建好的库）
 uv run python rag_agent.py
 
-# 5. 完整的 Agent：算术工具 + 知识库工具，带步数上限
+# 5. 完整的 Agent：算术工具 + 知识库工具，多轮对话，输入 exit 退出
 uv run python agent.py
 ```
 
@@ -480,7 +526,7 @@ rag_1/
 ├── tool_validation.py  # ⑧ 参数校验
 ├── tool_runtime.py     # ⑨ 超时 / 重试
 ├── rag_agent.py        # ⑩ RAG 封装成 Tool，两线合流
-├── agent.py            # ⑪ AgentState + MAX_STEPS（当前进度）
+├── agent.py            # ⑪ 有状态 Agent：多轮对话 + MAX_STEPS（当前进度）
 └── pyproject.toml      # 依赖：openai / chromadb / sentence-transformers
 ```
 
