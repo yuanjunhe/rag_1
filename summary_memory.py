@@ -34,12 +34,30 @@ class AgentState:
     # --------------------------------------------------------
     finished: bool = False
 
-    # 历史对话摘要
+    # --------------------------------------------------------
+    # 历史对话摘要总结
+    # --------------------------------------------------------
     summary: str = ""
 
 
 # ============================================================
-# 2. DeepSeek Client
+# 2. 配置
+# ============================================================
+
+MODEL = "deepseek-chat"
+
+# 单次任务最多允许的 Agent Loop 步数
+MAX_STEPS = 5
+
+# 消息数量超过该阈值时触发摘要
+SUMMARY_TRIGGER = 4
+
+# 摘要时至少保留的最近消息数量（实际会以 user 消息为边界对齐）
+KEEP_RECENT = 2
+
+
+# ============================================================
+# 3. DeepSeek Client
 # ============================================================
 
 client = AsyncOpenAI(
@@ -49,7 +67,216 @@ client = AsyncOpenAI(
 
 
 # ============================================================
-# 3. Tools
+# 4. 消息读取辅助
+#
+# state.messages 里混合了两种形态：
+#
+#   1. dict                        —— 我们自己构造的 user / tool 消息
+#   2. ChatCompletionMessage 对象  —— SDK 返回的 assistant 消息
+#
+# 这里统一封装，后面的代码不需要再到处判断类型。
+# ============================================================
+
+def message_role(message) -> str:
+    if isinstance(message, dict):
+        return message.get("role") or ""
+    return getattr(message, "role", "") or ""
+
+
+def message_content(message) -> str:
+    if isinstance(message, dict):
+        return message.get("content") or ""
+    return getattr(message, "content", None) or ""
+
+
+# ============================================================
+# 5. Summary Memory
+# ============================================================
+
+# ------------------------------------------------------------
+# 让 LLM 根据「已有摘要 + 新的旧消息」生成一份新的摘要
+# ------------------------------------------------------------
+async def summarize_messages(messages: list, old_summary: str = "") -> str:
+
+    # --------------------------------------------------------
+    # 把消息转换成文本
+    #
+    # Tool 消息不参与总结；
+    # 带 tool_calls 的 assistant 消息 content 为 None，也要跳过，
+    # 否则会生成一堆只有角色名的空行。
+    # --------------------------------------------------------
+    conversation = [
+        f"{message_role(message)}: {message_content(message)}"
+        for message in messages
+        if message_role(message) in ("user", "assistant")
+        and message_content(message).strip()
+    ]
+
+    # 没有可总结的内容，保持原摘要不变
+    if not conversation:
+        return old_summary
+
+    conversation_text = "\n".join(conversation)
+
+    prompt = f"""
+你是一个对话记忆总结器。
+
+请总结下面的历史对话，只保留未来继续对话时有价值的信息。
+
+重点保留：
+1. 用户的个人信息
+2. 用户的技术背景
+3. 用户的学习目标
+4. 用户已经完成的事情
+5. 用户的偏好
+6. 尚未完成的任务
+7. 重要上下文
+
+不要编造信息。
+
+已有摘要：
+{old_summary}
+
+新的历史对话：
+{conversation_text}
+
+请输出一份简洁的摘要。
+"""
+
+    response = await client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "你负责维护 Agent 的长期对话摘要。"
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    new_summary = response.choices[0].message.content
+
+    # 模型偶尔会返回空内容，这种情况下保持原摘要
+    return new_summary.strip() if new_summary else old_summary
+
+
+# ------------------------------------------------------------
+# 计算安全的切分点
+#
+# 返回的 index 表示：
+#   messages[1:index]  交给 LLM 总结
+#   messages[index:]   原样保留
+#
+# 必须以 user 消息作为边界，原因：
+#
+#   assistant 的 tool_calls 消息，必须紧跟着对应的 tool 消息，
+#   否则下一次请求会因为「tool 消息找不到对应的 tool_calls」而报错。
+#
+#   如果从中间切开，就会出现：
+#     - 保留的窗口以 tool 消息开头
+#     - 或者 tool_calls 被总结掉、只剩 tool 结果
+#   两种情况都会让对话直接失败。
+#
+# 向前回溯到最近的 user 消息，就能保证切分点落在完整轮次的边界上。
+# ------------------------------------------------------------
+def find_summary_split(messages: list) -> int:
+
+    split = max(1, len(messages) - KEEP_RECENT)
+
+    while split > 1 and message_role(messages[split]) != "user":
+        split -= 1
+
+    return split
+
+
+async def update_summary(state: AgentState):
+
+    # --------------------------------------------------------
+    # 消息数量没有超过阈值，不需要总结
+    # --------------------------------------------------------
+    if len(state.messages) <= SUMMARY_TRIGGER:
+        return
+
+    # --------------------------------------------------------
+    # 第一条是 system message
+    # --------------------------------------------------------
+    system_message = state.messages[0]
+
+    # --------------------------------------------------------
+    # 计算安全切分点
+    # --------------------------------------------------------
+    split = find_summary_split(state.messages)
+
+    # 没有可以总结的完整轮次，直接放弃本次总结
+    if split <= 1:
+        return
+
+    # --------------------------------------------------------
+    # 需要总结的旧消息 / 需要保留的最近消息
+    # --------------------------------------------------------
+    old_messages = state.messages[1:split]
+    recent_messages = state.messages[split:]
+
+    # --------------------------------------------------------
+    # 让 LLM 总结旧消息
+    # --------------------------------------------------------
+    new_summary = await summarize_messages(
+        old_messages,
+        state.summary
+    )
+
+    # 摘要是空的说明这次总结没有产出，宁可让消息继续堆积，
+    # 也不能在没有摘要的情况下丢掉旧消息
+    if not new_summary:
+        return
+
+    # --------------------------------------------------------
+    # 更新 Summary，并删除旧消息
+    # 只保留 system + 最近消息
+    # --------------------------------------------------------
+    state.summary = new_summary
+
+    state.messages = [
+        system_message,
+        *recent_messages
+    ]
+
+    print("\n========== Summary Memory ==========")
+    print(state.summary)
+    print("====================================\n")
+
+
+# ------------------------------------------------------------
+# 组装真正发给 LLM 的上下文
+#
+# system prompt + 摘要 + 最近消息
+# ------------------------------------------------------------
+def build_context(state: AgentState) -> list:
+
+    context = []
+
+    # System Prompt
+    if state.messages:
+        context.append(state.messages[0])
+
+    # Summary
+    if state.summary:
+        context.append({
+            "role": "system",
+            "content": f"以下是之前对话的重要记忆：\n\n{state.summary}"
+        })
+
+    # 最近消息
+    context.extend(state.messages[1:])
+
+    return context
+
+
+# ============================================================
+# 6. Tools
 # ============================================================
 
 def add(a: int, b: int):
@@ -65,7 +292,7 @@ def subtract(a: int, b: int):
 
 
 # ============================================================
-# 4. Tool Registry
+# 7. Tool Registry
 # ============================================================
 
 TOOL_REGISTRY = {
@@ -77,7 +304,7 @@ TOOL_REGISTRY = {
 
 
 # ============================================================
-# 5. Tool Schema
+# 8. Tool Schema
 # ============================================================
 
 TOOLS = [
@@ -150,7 +377,7 @@ TOOLS = [
 
 
 # ============================================================
-# 6. Dispatcher
+# 9. Dispatcher
 # ============================================================
 
 def dispatch_tool(tool_name: str, arguments: dict):
@@ -177,7 +404,7 @@ def dispatch_tool(tool_name: str, arguments: dict):
 
 
 # ============================================================
-# 7. Agent
+# 10. Agent
 #
 # 注意：
 # Agent 不再创建 State。
@@ -187,16 +414,16 @@ def dispatch_tool(tool_name: str, arguments: dict):
 
 async def agent(state: AgentState):
 
-    MAX_STEPS = 10
-
     # --------------------------------------------------------
     # 每次处理一个用户问题时，
-    # 重新计算本次 Agent Loop 的步骤。
+    # 重置本轮状态，重新计算本次 Agent Loop 的步骤。
     # --------------------------------------------------------
+    state.step = 0
+    state.finished = False
 
-    for step in range(MAX_STEPS):
+    while state.step < MAX_STEPS:
 
-        state.step = step + 1
+        state.step += 1
 
         print(
             f"\n========== Agent Step "
@@ -207,14 +434,25 @@ async def agent(state: AgentState):
         # 调用 LLM
         # ----------------------------------------------------
 
+        context = build_context(state)
         response = await client.chat.completions.create(
-            model="deepseek-chat",
-            messages=state.messages,
+            model=MODEL,
+            messages=context,
             tools=TOOLS,
             tool_choice="auto",
         )
 
         message = response.choices[0].message
+
+        # ----------------------------------------------------
+        # 保存 assistant 消息
+        #
+        # 无论是否带 tool_calls 都要保存，
+        # 否则对话历史里只剩下用户说的话，
+        # 模型看不到自己之前的回答，摘要也就无从谈起。
+        # ----------------------------------------------------
+
+        state.messages.append(message)
 
         # ----------------------------------------------------
         # 没有 Tool Call
@@ -229,12 +467,6 @@ async def agent(state: AgentState):
             return message.content
 
         # ----------------------------------------------------
-        # 保存 assistant Tool Call
-        # ----------------------------------------------------
-
-        state.messages.append(message)
-
-        # ----------------------------------------------------
         # 执行 Tool
         # ----------------------------------------------------
 
@@ -242,14 +474,24 @@ async def agent(state: AgentState):
 
             tool_name = tool_call.function.name
 
-            arguments = json.loads(
-                tool_call.function.arguments
-            )
+            # 解析失败时不要把整个 Agent 弄崩，
+            # 把错误当成 Tool 结果交回给模型，让它自己纠正
+            try:
 
-            result = dispatch_tool(
-                tool_name,
-                arguments
-            )
+                arguments = json.loads(
+                    tool_call.function.arguments
+                )
+
+            except json.JSONDecodeError as e:
+
+                result = f"Tool 参数解析失败：{e}"
+
+            else:
+
+                result = dispatch_tool(
+                    tool_name,
+                    arguments
+                )
 
             # ------------------------------------------------
             # 保存 Tool Result
@@ -267,7 +509,7 @@ async def agent(state: AgentState):
 
 
 # ============================================================
-# 8. Main
+# 11. Main
 # ============================================================
 
 async def main():
@@ -311,7 +553,7 @@ async def main():
 
     while True:
 
-        question = input("\n用户：")
+        question = input("\n用户：").strip()
 
         # ----------------------------------------------------
         # 退出
@@ -320,6 +562,13 @@ async def main():
         if question.lower() == "exit":
             print("Agent 已退出。")
             break
+
+        # ----------------------------------------------------
+        # 空输入直接跳过，避免把空消息发给模型
+        # ----------------------------------------------------
+
+        if not question:
+            continue
 
         # ----------------------------------------------------
         # 把用户消息加入 State
@@ -343,9 +592,12 @@ async def main():
 
         print(f"\nAgent：{answer}")
 
+        # 一轮任务完成后检查是否需要总结
+        await update_summary(state)
+
 
 # ============================================================
-# 9. 启动
+# 12. 启动
 # ============================================================
 
 if __name__ == "__main__":
